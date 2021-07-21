@@ -1,5 +1,44 @@
 import { promises as fsp } from 'fs';
 import { instantiateEmscriptenWasm, pathify } from './emscripten-utils.js';
+import { threads } from 'wasm-feature-detect';
+import { cpus } from 'os';
+
+// We use `navigator.hardwareConcurrency` for Emscripten’s pthread pool size.
+// This is the only workaround I can get working without crying.
+(globalThis as any).navigator = {
+  hardwareConcurrency: cpus().length,
+};
+
+interface RotateModuleInstance {
+  exports: {
+    memory: WebAssembly.Memory;
+    rotate(width: number, height: number, rotate: number): void;
+  };
+}
+
+interface ResizeWithAspectParams {
+  input_width: number;
+  input_height: number;
+  target_width: number;
+  target_height: number;
+}
+
+interface ResizeInstantiateOptions {
+  width: number;
+  height: number;
+  method: string;
+  premultiply: boolean;
+  linearRGB: boolean;
+}
+
+declare global {
+  // Needed for being able to use ImageData as type in codec types
+  type ImageData = typeof import('./image_data.js');
+  // Needed for being able to assign to `globalThis.ImageData`
+  var ImageData: ImageData['constructor'];
+}
+
+import type { QuantizerModule } from '../../codecs/imagequant/imagequant.js';
 
 // MozJPEG
 import mozEnc from '../../codecs/mozjpeg/enc/mozjpeg_node_enc.js';
@@ -16,6 +55,9 @@ import webpDecWasm from 'asset-url:../../codecs/webp/dec/webp_node_dec.wasm';
 // AVIF
 import avifEnc from '../../codecs/avif/enc/avif_node_enc.js';
 import avifEncWasm from 'asset-url:../../codecs/avif/enc/avif_node_enc.wasm';
+import avifEncMt from '../../codecs/avif/enc/avif_node_enc_mt.js';
+import avifEncMtWorker from 'chunk-url:../../codecs/avif/enc/avif_node_enc_mt.worker.js';
+import avifEncMtWasm from 'asset-url:../../codecs/avif/enc/avif_node_enc_mt.wasm';
 import avifDec from '../../codecs/avif/dec/avif_node_dec.js';
 import avifDecWasm from 'asset-url:../../codecs/avif/dec/avif_node_dec.wasm';
 
@@ -51,16 +93,22 @@ const resizePromise = resize.default(fsp.readFile(pathify(resizeWasm)));
 // rotate
 import rotateWasm from 'asset-url:../../codecs/rotate/rotate.wasm';
 
+// TODO(ergunsh): Type definitions of some modules do not exist
+// Figure out creating type definitions for them and remove `allowJs` rule
+// We shouldn't need to use Promise<QuantizerModule> below after getting type definitions for imageQuant
 // ImageQuant
 import imageQuant from '../../codecs/imagequant/imagequant_node.js';
 import imageQuantWasm from 'asset-url:../../codecs/imagequant/imagequant_node.wasm';
-const imageQuantPromise = instantiateEmscriptenWasm(imageQuant, imageQuantWasm);
+const imageQuantPromise: Promise<QuantizerModule> = instantiateEmscriptenWasm(
+  imageQuant,
+  imageQuantWasm,
+);
 
 // Our decoders currently rely on a `ImageData` global.
 import ImageData from './image_data.js';
 globalThis.ImageData = ImageData;
 
-function resizeNameToIndex(name) {
+function resizeNameToIndex(name: string) {
   switch (name) {
     case 'triangle':
       return 0;
@@ -80,25 +128,26 @@ function resizeWithAspect({
   input_height,
   target_width,
   target_height,
-}) {
+}: ResizeWithAspectParams): { width: number; height: number } {
   if (!target_width && !target_height) {
     throw Error('Need to specify at least width or height when resizing');
   }
+
   if (target_width && target_height) {
     return { width: target_width, height: target_height };
   }
+
   if (!target_width) {
     return {
       width: Math.round((input_width / input_height) * target_height),
       height: target_height,
     };
   }
-  if (!target_height) {
-    return {
-      width: target_width,
-      height: Math.round((input_height / input_width) * target_width),
-    };
-  }
+
+  return {
+    width: target_width,
+    height: Math.round((input_height / input_width) * target_width),
+  };
 }
 
 export const preprocessors = {
@@ -108,10 +157,16 @@ export const preprocessors = {
     instantiate: async () => {
       await resizePromise;
       return (
-        buffer,
-        input_width,
-        input_height,
-        { width, height, method, premultiply, linearRGB },
+        buffer: Uint8Array,
+        input_width: number,
+        input_height: number,
+        {
+          width,
+          height,
+          method,
+          premultiply,
+          linearRGB,
+        }: ResizeInstantiateOptions,
       ) => {
         ({ width, height } = resizeWithAspect({
           input_width,
@@ -148,7 +203,12 @@ export const preprocessors = {
     description: 'Reduce the number of colors used (aka. paletting)',
     instantiate: async () => {
       const imageQuant = await imageQuantPromise;
-      return (buffer, width, height, { numColors, dither }) =>
+      return (
+        buffer: Uint8Array,
+        width: number,
+        height: number,
+        { numColors, dither }: { numColors: number; dither: number },
+      ) =>
         new ImageData(
           imageQuant.quantize(buffer, width, height, numColors, dither),
           width,
@@ -164,13 +224,18 @@ export const preprocessors = {
     name: 'Rotate',
     description: 'Rotate image',
     instantiate: async () => {
-      return async (buffer, width, height, { numRotations }) => {
+      return async (
+        buffer: Uint8Array,
+        width: number,
+        height: number,
+        { numRotations }: { numRotations: number },
+      ) => {
         const degrees = (numRotations * 90) % 360;
         const sameDimensions = degrees == 0 || degrees == 180;
         const size = width * height * 4;
-        const { instance } = await WebAssembly.instantiate(
-          await fsp.readFile(pathify(rotateWasm)),
-        );
+        const instance = (
+          await WebAssembly.instantiate(await fsp.readFile(pathify(rotateWasm)))
+        ).instance as RotateModuleInstance;
         const { memory } = instance.exports;
         const additionalPagesNeeded = Math.ceil(
           (size * 2 - memory.buffer.byteLength + 8) / (64 * 1024),
@@ -228,7 +293,7 @@ export const codecs = {
   webp: {
     name: 'WebP',
     extension: 'webp',
-    detectors: [/^RIFF....WEBPVP8[LX ]/],
+    detectors: [/^RIFF....WEBPVP8[LX ]/s],
     dec: () => instantiateEmscriptenWasm(webpDec, webpDecWasm),
     enc: () => instantiateEmscriptenWasm(webpEnc, webpEncWasm),
     defaultEncoderOptions: {
@@ -271,21 +336,32 @@ export const codecs = {
     extension: 'avif',
     detectors: [/^\x00\x00\x00 ftypavif\x00\x00\x00\x00/],
     dec: () => instantiateEmscriptenWasm(avifDec, avifDecWasm),
-    enc: () => instantiateEmscriptenWasm(avifEnc, avifEncWasm),
+    enc: async () => {
+      if (await threads()) {
+        return instantiateEmscriptenWasm(
+          avifEncMt,
+          avifEncMtWasm,
+          avifEncMtWorker,
+        );
+      }
+      return instantiateEmscriptenWasm(avifEnc, avifEncWasm);
+    },
     defaultEncoderOptions: {
-      minQuantizer: 33,
-      maxQuantizer: 63,
-      minQuantizerAlpha: 33,
-      maxQuantizerAlpha: 63,
+      cqLevel: 33,
+      cqAlphaLevel: -1,
+      denoiseLevel: 0,
       tileColsLog2: 0,
       tileRowsLog2: 0,
-      speed: 8,
+      speed: 6,
       subsample: 1,
+      chromaDeltaQ: false,
+      sharpness: 0,
+      tune: 0 /* AVIFTune.auto */,
     },
     autoOptimize: {
-      option: 'maxQuantizer',
-      min: 0,
-      max: 62,
+      option: 'cqLevel',
+      min: 62,
+      max: 0,
     },
   },
   jxl: {
@@ -301,6 +377,7 @@ export const codecs = {
       epf: -1,
       nearLossless: 0,
       lossyPalette: false,
+      decodingSpeedTier: 0,
     },
     autoOptimize: {
       option: 'quality',
@@ -343,9 +420,18 @@ export const codecs = {
       await pngEncDecPromise;
       await oxipngPromise;
       return {
-        encode: (buffer, width, height, opts) => {
-          const simplePng = pngEncDec.encode(new Uint8Array(buffer), width, height);
-          return oxipng.optimise(simplePng, opts.level);
+        encode: (
+          buffer: Uint8Array,
+          width: number,
+          height: number,
+          opts: { level: number },
+        ) => {
+          const simplePng = pngEncDec.encode(
+            new Uint8Array(buffer),
+            width,
+            height,
+          );
+          return oxipng.optimise(simplePng, opts.level, false);
         },
       };
     },
